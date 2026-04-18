@@ -1,2 +1,9 @@
 .DS_Store
 .transcribe.local.json
+.hf-cache/
+Data/artifacts/
+Data/structured/
+Data/input/
+Data/output/
+meeting.artifacts/
+recordings/

@@ -7,8 +7,10 @@ ASR/align 단계는 생략하고, regular diarization + exclusive diarization in
 
 import argparse
 import json
+import os
 import subprocess
 import warnings
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +22,22 @@ warnings.filterwarnings("ignore", category=UserWarning, module=r"pyannote\.audio
 
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+def load_audio_wave(audio_path: str) -> np.ndarray:
+    with wave.open(audio_path, "rb") as handle:
+        channels = handle.getnchannels()
+        sample_width = handle.getsampwidth()
+        sample_rate = handle.getframerate()
+        frames = handle.getnframes()
+        if sample_width != 2:
+            raise RuntimeError(f"WAV sample width가 지원되지 않습니다: {sample_width}")
+        pcm = np.frombuffer(handle.readframes(frames), dtype=np.int16)
+        if channels > 1:
+            pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
+        if sample_rate != 16000:
+            raise RuntimeError(f"WAV sample rate가 16kHz가 아닙니다: {sample_rate}")
+    return pcm.astype(np.float32) / 32768.0
 
 
 def load_audio_ffmpeg(audio_path: str, sample_rate: int = 16000) -> np.ndarray:
@@ -56,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diarize-model", required=True, help="pyannote diarization model")
     parser.add_argument("--device", default="mps", help="torch device")
     parser.add_argument("--cache-dir", help="모델 캐시 디렉토리")
+    parser.add_argument("--num-speakers", type=int, help="정확한 화자 수")
     parser.add_argument("--min-speakers", type=int, help="최소 화자 수")
     parser.add_argument("--max-speakers", type=int, help="최대 화자 수")
     return parser.parse_args()
@@ -63,6 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
 
     import torch
     from pyannote.audio import Pipeline
@@ -85,16 +105,24 @@ def main() -> None:
             percent = min((completed / total) * 100.0, 100.0)
             log(f"pyannote progress: {percent:.1f}%")
 
-    waveform = load_audio_ffmpeg(args.audio)
+    if str(args.audio).lower().endswith(".wav"):
+        waveform = load_audio_wave(args.audio)
+    else:
+        waveform = load_audio_ffmpeg(args.audio)
     audio_input = {
         "waveform": torch.from_numpy(waveform[None, :]),
         "sample_rate": 16000,
     }
 
+    num_speakers = args.num_speakers
+    if num_speakers is None and args.min_speakers is not None and args.min_speakers == args.max_speakers:
+        num_speakers = args.min_speakers
+
     output = pipeline(
         audio_input,
-        min_speakers=args.min_speakers,
-        max_speakers=args.max_speakers,
+        num_speakers=num_speakers,
+        min_speakers=None if num_speakers is not None else args.min_speakers,
+        max_speakers=None if num_speakers is not None else args.max_speakers,
         hook=on_progress,
     )
 
