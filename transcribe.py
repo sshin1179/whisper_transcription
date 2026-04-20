@@ -47,6 +47,10 @@ DEFAULT_AUTO_CHUNK_MINUTES = 60.0
 DEFAULT_CHUNK_OVERLAP_SECONDS = 1.5
 DEFAULT_SEGMENT_MERGE_GAP = 0.8
 DEFAULT_SEGMENT_BREAK_GAP = 1.2
+DEFAULT_DIARIZATION_MICRO_TURN_SECONDS = 0.35
+DEFAULT_DIARIZATION_MICRO_GAP_SECONDS = 0.25
+DEFAULT_SHORT_SPEAKER_TURN_SECONDS = 1.2
+DEFAULT_SHORT_SPEAKER_TURN_TEXT_CHARS = 12
 DEFAULT_LOCAL_CONFIG_NAME = ".transcribe.local.json"
 DEFAULT_SHARED_GLOSSARY_NAME = "glossary.shared.json"
 DEFAULT_ICLOUD_WHISPER_DIR = (
@@ -54,8 +58,8 @@ DEFAULT_ICLOUD_WHISPER_DIR = (
 )
 DEFAULT_ICLOUD_INPUT_DIRNAME = "Whisper_input"
 DEFAULT_ICLOUD_OUTPUT_DIRNAME = "Whisper_output"
-QUALITY_CHOICES = ("fast", "standard", "max")
-DEFAULT_PROGRESS_OUTPUTS = False
+QUALITY_CHOICES = ("fast", "normal", "max")
+DEFAULT_PROGRESS_OUTPUTS = True
 DEFAULT_RUN_LOCK_NAME = ".transcribe.lock"
 DEFAULT_SHARED_MODEL_CACHE_DIRNAME = "_shared_models"
 DEFAULT_REVIEW_TEMPERATURES = (0.0, 0.2, 0.4)
@@ -73,6 +77,12 @@ DEFAULT_REVIEW_MAX_WINDOW_SECONDS = 12.0
 DEFAULT_REVIEW_MAX_WINDOWS = 10
 DEFAULT_REVIEW_MAX_TOTAL_SECONDS = 120.0
 DEFAULT_REVIEW_CONTEXT_CHARS = 220
+DEFAULT_CHUNK_CONTEXT_CHARS = 140
+DEFAULT_TRANSCRIBE_SAMPLE_LEN = 128
+DEFAULT_REVIEW_SAMPLE_LEN = 96
+DEFAULT_HALLUCINATION_DROP_SCORE = 3.2
+DEFAULT_HALLUCINATION_DROP_COMPRESSION = 8.0
+DEFAULT_HALLUCINATION_DROP_NO_SPEECH = 0.72
 MAX_INITIAL_PROMPT_CHARS = 320
 MAX_GLOSSARY_PROMPT_TERMS = 24
 AUTO_GLOSSARY_STOPWORDS = {
@@ -489,6 +499,15 @@ def write_json(path: Path, payload: Dict) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
+def is_cache_fresh(cache_path: Path, source_path: Path) -> bool:
+    if not cache_path.is_file():
+        return False
+    try:
+        return cache_path.stat().st_mtime >= source_path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+
+
 def parse_formats(value: str) -> List[str]:
     raw = [item.strip().lower() for item in value.split(",") if item.strip()]
     if not raw:
@@ -522,6 +541,14 @@ def resolve_hf_token(cli_value: Optional[str]) -> Optional[str]:
     return None
 
 
+def ensure_hf_hub_env_token(token: Optional[str]) -> None:
+    if not token:
+        return
+    for env_name in HF_TOKEN_ENV_NAMES:
+        if not os.getenv(env_name):
+            os.environ[env_name] = token
+
+
 def load_local_config(config_path: Path) -> Dict:
     if not config_path.is_file():
         return {}
@@ -544,7 +571,7 @@ def resolve_bool_option(current: Optional[bool], config: Dict, key: str, default
 
 def resolve_quality_option(current: Optional[str], config: Dict) -> str:
     if current is not None:
-        return current
+        return current.strip().lower()
 
     value = config.get("quality", DEFAULT_QUALITY)
     if not isinstance(value, str):
@@ -553,7 +580,9 @@ def resolve_quality_option(current: Optional[str], config: Dict) -> str:
     normalized = value.strip().lower()
     if normalized not in QUALITY_CHOICES:
         raise RuntimeError(
-            "로컬 설정의 `quality` 값은 " + ", ".join(QUALITY_CHOICES) + " 중 하나여야 합니다."
+            "로컬 설정의 `quality` 값은 "
+            + ", ".join(QUALITY_CHOICES)
+            + " 중 하나여야 합니다."
         )
     return normalized
 
@@ -753,6 +782,19 @@ def extract_filename_glossary_entries(audio_path: Path) -> List[GlossaryEntry]:
     return dedupe_glossary_entries(candidates)
 
 
+def infer_num_speakers_from_filename(audio_path: Path) -> Optional[int]:
+    stem = re.sub(r"[_-]?\d{6,8}$", "", audio_path.stem)
+    for match in re.finditer(r"\(([^()]*)\)", stem):
+        participants = []
+        for raw_token in match.group(1).split(","):
+            token = normalize_auto_glossary_term(raw_token)
+            if token:
+                participants.append(token)
+        if 2 <= len(participants) <= 8:
+            return len(participants)
+    return None
+
+
 def extract_transcript_glossary_entries(segments: Sequence[Dict]) -> List[GlossaryEntry]:
     counts: Counter[str] = Counter()
 
@@ -858,10 +900,13 @@ def find_output_json(output_dir: Path, preferred_stems: Optional[Sequence[str]] 
     raise FileNotFoundError(f"결과 JSON을 찾을 수 없습니다: {output_dir}")
 
 
-def effective_transcribe_model(args: argparse.Namespace) -> str:
-    if args.quality == "max" and args.transcribe_model == DEFAULT_TRANSCRIBE_MODEL:
-        return MAX_QUALITY_TRANSCRIBE_MODEL
-    return args.transcribe_model
+def effective_transcribe_model(args: argparse.Namespace, *, review_pass: bool = False) -> str:
+    _ = review_pass
+    if args.transcribe_model != DEFAULT_TRANSCRIBE_MODEL:
+        return args.transcribe_model
+    if args.quality == "fast":
+        return DEFAULT_TRANSCRIBE_MODEL
+    return MAX_QUALITY_TRANSCRIBE_MODEL
 
 
 def build_transcribe_decode_options(
@@ -872,20 +917,24 @@ def build_transcribe_decode_options(
     review_pass: bool = False,
     language_override: Optional[str] = None,
 ) -> Dict[str, object]:
+    is_fast_quality = args.quality == "fast"
     is_max_quality = args.quality == "max"
     decode_options: Dict[str, object] = {
-        "path_or_hf_repo": effective_transcribe_model(args),
+        "path_or_hf_repo": effective_transcribe_model(args, review_pass=review_pass),
         "verbose": False,
         # Keep the first pass deterministic; short review windows can afford a tiny fallback ladder.
         "temperature": (0.0, 0.2) if review_pass else 0.0,
         # Disabling previous-text conditioning reduces repetition loops on meeting audio.
         "condition_on_previous_text": False,
-        "compression_ratio_threshold": 2.0 if is_max_quality else 2.4,
-        "logprob_threshold": -0.7 if is_max_quality else -1.0,
-        "no_speech_threshold": 0.6,
+        # fp32 is much slower when a segment runs to Whisper's default token cap.
+        # Keep dense Korean speech intact while bounding pathological decode loops.
+        "sample_len": DEFAULT_REVIEW_SAMPLE_LEN if review_pass else DEFAULT_TRANSCRIBE_SAMPLE_LEN,
+        "compression_ratio_threshold": 2.4 if is_fast_quality else (1.9 if is_max_quality else 2.0),
+        "logprob_threshold": -1.0 if is_fast_quality else (-0.6 if is_max_quality else -0.7),
+        "no_speech_threshold": 0.65 if is_fast_quality else 0.6,
         "word_timestamps": word_timestamps,
-        # Keep max quality practical on Apple Silicon by running inference in fp16.
-        "fp16": True,
+        # Run the whole transcription/review pipeline in fp32.
+        "fp16": False,
     }
 
     if word_timestamps:
@@ -922,6 +971,8 @@ def build_transcribe_cache_stem(
     )
     if clip_timestamps:
         decode_options["clip_timestamps"] = clip_timestamps
+    # Progress display does not affect transcription semantics; keep cache keys stable.
+    decode_options["verbose"] = False
     cache_payload = json.dumps(
         decode_options,
         ensure_ascii=False,
@@ -935,9 +986,10 @@ def build_transcribe_cache_stem(
 
 
 def describe_transcribe_runtime(args: argparse.Namespace, *, word_timestamps: bool) -> str:
-    details = ["fp16", "greedy"]
-    if args.quality == "max":
+    details = ["fp32", "greedy"]
+    if args.quality in ("normal", "max"):
         details.append("no-prev-text")
+    details.append(f"sample-len:{DEFAULT_TRANSCRIBE_SAMPLE_LEN}")
     details.append("word-ts" if word_timestamps else "segment-ts")
     return ", ".join(details)
 
@@ -1085,7 +1137,7 @@ def materialize_chunk(audio_path: Path, chunk: ChunkSpec, force: bool) -> Path:
     if not chunk.is_chunked:
         return audio_path
 
-    if chunk.output_audio_path.is_file() and not force:
+    if not force and is_cache_fresh(chunk.output_audio_path, audio_path):
         return chunk.output_audio_path
 
     ffmpeg = require_ffmpeg()
@@ -1122,7 +1174,7 @@ def materialize_chunk(audio_path: Path, chunk: ChunkSpec, force: bool) -> Path:
 
 def prepare_work_audio(audio_path: Path, artifact_dir: Path, force: bool) -> Path:
     work_audio_path = artifact_dir / "_work_audio" / "source_16k_mono.wav"
-    if work_audio_path.is_file() and not force:
+    if not force and is_cache_fresh(work_audio_path, audio_path):
         log(f"work audio cache 사용: {work_audio_path}")
         return work_audio_path
 
@@ -1155,15 +1207,17 @@ def load_or_run_mlx(
     artifact_dir: Path,
     args: argparse.Namespace,
     word_timestamps: bool,
+    extra_prompt: Optional[str] = None,
     language_override: Optional[str] = None,
 ) -> Dict:
     output_stem = build_transcribe_cache_stem(
         args,
         word_timestamps=word_timestamps,
+        extra_prompt=extra_prompt,
         language_override=language_override,
     )
     json_path = artifact_dir / "mlx" / f"{output_stem}.json"
-    if json_path.is_file() and not args.force:
+    if not args.force and is_cache_fresh(json_path, audio_path):
         log(f"mlx cache 사용: {json_path}")
         return read_json(json_path)
 
@@ -1179,6 +1233,7 @@ def load_or_run_mlx(
     decode_options = build_transcribe_decode_options(
         args,
         word_timestamps=word_timestamps,
+        extra_prompt=extra_prompt,
         language_override=language_override,
     )
     result = mlx_transcribe(str(audio_path), **decode_options)
@@ -1197,7 +1252,7 @@ def load_or_run_diarization(
     output_dir = artifact_dir / "whispermlx"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_json = output_dir / "diarization_intervals.json"
-    if output_json.is_file() and not args.force:
+    if not args.force and is_cache_fresh(output_json, audio_path):
         log(f"diarization cache 사용: {output_json}")
         payload = read_json(output_json)
         preferred_key = payload.get("preferred")
@@ -1429,6 +1484,14 @@ def longest_adjacent_phrase_run(tokens: Sequence[str], phrase_length: int) -> in
     return longest
 
 
+def quality_token_cores(tokens: Sequence[str]) -> List[str]:
+    return [
+        re.sub(r"[^0-9A-Za-z가-힣]+", "", token).lower()
+        for token in tokens
+        if re.sub(r"[^0-9A-Za-z가-힣]+", "", token)
+    ]
+
+
 def score_segment_for_review(segment: Dict) -> Tuple[float, List[str]]:
     score = 0.0
     reasons: List[str] = []
@@ -1456,6 +1519,11 @@ def score_segment_for_review(segment: Dict) -> Tuple[float, List[str]]:
         score += 1.4 + (0.55 * (max_bigram_repeat_run - 3))
         reasons.append(f"repeat-phrase-2:{max_bigram_repeat_run}")
 
+    max_trigram_repeat_run = longest_adjacent_phrase_run(tokens, 3)
+    if max_trigram_repeat_run >= 2:
+        score += 1.8 + (0.7 * (max_trigram_repeat_run - 2))
+        reasons.append(f"repeat-phrase-3:{max_trigram_repeat_run}")
+
     if tokens:
         short_token_ratio = sum(
             1 for token in tokens if len(re.sub(r"[^0-9A-Za-z가-힣]+", "", token)) <= 2
@@ -1463,11 +1531,7 @@ def score_segment_for_review(segment: Dict) -> Tuple[float, List[str]]:
         if len(tokens) >= 6 and short_token_ratio >= 0.7:
             score += 0.7
             reasons.append("short-token-heavy")
-        token_cores = [
-            re.sub(r"[^0-9A-Za-z가-힣]+", "", token).lower()
-            for token in tokens
-            if re.sub(r"[^0-9A-Za-z가-힣]+", "", token)
-        ]
+        token_cores = quality_token_cores(tokens)
         if token_cores and len(tokens) >= 10:
             unique_ratio = len(set(token_cores)) / len(token_cores)
             if unique_ratio <= 0.45:
@@ -1483,6 +1547,75 @@ def score_segment_for_review(segment: Dict) -> Tuple[float, List[str]]:
         reasons.append("char-repeat")
 
     return score, reasons
+
+
+def is_hallucination_like_segment(
+    segment: Dict,
+    *,
+    score: Optional[float] = None,
+    reasons: Optional[Sequence[str]] = None,
+) -> bool:
+    text = str(segment.get("text") or "").strip()
+    tokens = tokenize_quality_text(text)
+    if len(tokens) < 3:
+        return False
+
+    score = score if score is not None else score_segment_for_review(segment)[0]
+    reasons = list(reasons) if reasons is not None else score_segment_for_review(segment)[1]
+    reason_prefixes = {reason.split(":", 1)[0] for reason in reasons}
+    token_cores = quality_token_cores(tokens)
+    unique_ratio = (
+        len(set(token_cores)) / len(token_cores)
+        if token_cores
+        else 1.0
+    )
+    repeat_run = longest_adjacent_token_run(tokens)
+    phrase_repeat_2 = longest_adjacent_phrase_run(tokens, 2)
+    phrase_repeat_3 = longest_adjacent_phrase_run(tokens, 3)
+    compression_ratio = coerce_float(segment.get("compression_ratio"))
+    no_speech_prob = coerce_float(segment.get("no_speech_prob"))
+    repeated = (
+        repeat_run >= 5
+        or phrase_repeat_2 >= 4
+        or phrase_repeat_3 >= 3
+        or "char-repeat" in reason_prefixes
+    )
+    metadata_bad = (
+        compression_ratio >= DEFAULT_HALLUCINATION_DROP_COMPRESSION
+        or no_speech_prob >= DEFAULT_HALLUCINATION_DROP_NO_SPEECH
+    )
+    low_information = (
+        unique_ratio <= 0.38
+        or ("short-token-heavy" in reason_prefixes and len(token_cores) >= 8)
+        or ("low-density" in reason_prefixes and len(token_cores) <= 12)
+    )
+    return score >= DEFAULT_HALLUCINATION_DROP_SCORE and repeated and (metadata_bad or low_information)
+
+
+def should_accept_empty_review(
+    original_segments: Sequence[Dict],
+    window: ReviewWindow,
+) -> bool:
+    if not original_segments:
+        return True
+
+    scored_segments = [
+        (segment, *score_segment_for_review(segment))
+        for segment in original_segments
+    ]
+    if scored_segments and all(
+        is_hallucination_like_segment(segment, score=score, reasons=reasons)
+        for segment, score, reasons in scored_segments
+    ):
+        return True
+
+    if window.start <= 1.0 and any(
+        is_hallucination_like_segment(segment, score=score, reasons=reasons)
+        for segment, score, reasons in scored_segments
+    ):
+        return True
+
+    return False
 
 
 def cap_review_window(window: ReviewWindow, duration: float) -> ReviewWindow:
@@ -1596,6 +1729,24 @@ def build_review_context_prompt(
     return context[:DEFAULT_REVIEW_CONTEXT_CHARS]
 
 
+def build_chunk_context_prompt(segments: Sequence[Dict]) -> Optional[str]:
+    context = " ".join(
+        str(segment.get("text") or "").strip()
+        for segment in segments
+        if str(segment.get("text") or "").strip()
+    )
+    if not context:
+        return None
+    if len(context) <= DEFAULT_CHUNK_CONTEXT_CHARS:
+        return context
+
+    trimmed = context[-DEFAULT_CHUNK_CONTEXT_CHARS:].lstrip()
+    first_space = trimmed.find(" ")
+    if first_space > 0:
+        trimmed = trimmed[first_space + 1 :].lstrip()
+    return trimmed or context[-DEFAULT_CHUNK_CONTEXT_CHARS:]
+
+
 def load_or_run_review_window(
     audio_path: Path,
     artifact_dir: Path,
@@ -1616,7 +1767,7 @@ def load_or_run_review_window(
         language_override=language_override,
     )
     json_path = artifact_dir / "mlx" / f"{output_stem}.json"
-    if json_path.is_file() and not args.force:
+    if not args.force and is_cache_fresh(json_path, audio_path):
         log(f"review cache 사용: {json_path}")
         return read_json(json_path)
 
@@ -1644,7 +1795,7 @@ def load_or_run_review_window(
 
 def compute_segments_review_score(segments: Sequence[Dict]) -> float:
     if not segments:
-        return 2.0
+        return 0.0
     return sum(score_segment_for_review(segment)[0] for segment in segments) / len(segments)
 
 
@@ -1691,13 +1842,14 @@ def refine_transcription_segments(
     for review_idx, window in enumerate(review_windows, start=1):
         original_segments = collect_segments_in_window(refined_segments, window.start, window.end)
         context_prompt = build_review_context_prompt(refined_segments, window.start, window.end)
+        review_word_timestamps = True
         reviewed_payload = normalize_result(
             load_or_run_review_window(
                 audio_path,
                 artifact_dir,
                 args,
                 window,
-                word_timestamps=word_timestamps,
+                word_timestamps=review_word_timestamps,
                 extra_prompt=context_prompt,
                 language_override=language_override,
             )
@@ -1712,9 +1864,14 @@ def refine_transcription_segments(
         reviewed_score = compute_segments_review_score(reviewed_segments)
         original_text = " ".join(segment.get("text", "").strip() for segment in original_segments).strip()
         reviewed_text = " ".join(segment.get("text", "").strip() for segment in reviewed_segments).strip()
-        accepted = bool(reviewed_segments) and (
-            not original_segments
-            or reviewed_score <= original_score + 0.05
+        accepted = (
+            not reviewed_segments and should_accept_empty_review(original_segments, window)
+        ) or (
+            bool(reviewed_segments)
+            and (
+                not original_segments
+                or reviewed_score <= original_score + 0.05
+            )
         )
 
         if accepted:
@@ -1747,6 +1904,26 @@ def refine_transcription_segments(
         )
 
     return refined_segments, review_records
+
+
+def prune_hallucination_like_segments(segments: Sequence[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    cleaned_segments = []
+    pruned_records = []
+    for segment in segments:
+        score, reasons = score_segment_for_review(segment)
+        if is_hallucination_like_segment(segment, score=score, reasons=reasons):
+            pruned_records.append(
+                {
+                    "start": round(segment["start"], 3),
+                    "end": round(segment["end"], 3),
+                    "score": round(score, 3),
+                    "reasons": list(reasons),
+                    "text": str(segment.get("text") or "").strip(),
+                }
+            )
+            continue
+        cleaned_segments.append(clone_segment(segment))
+    return cleaned_segments, pruned_records
 
 
 def flatten_words(segments: Sequence[Dict]) -> List[Dict]:
@@ -1783,6 +1960,49 @@ def merge_speaker_intervals(intervals: Sequence[Dict], max_gap: float = 0.15) ->
             merged[-1]["end"] = max(merged[-1]["end"], interval["end"])
         else:
             merged.append(dict(interval))
+    return merged
+
+
+def suppress_micro_speaker_flips(
+    intervals: Sequence[Dict],
+    *,
+    max_duration: float = DEFAULT_DIARIZATION_MICRO_TURN_SECONDS,
+    max_gap: float = DEFAULT_DIARIZATION_MICRO_GAP_SECONDS,
+) -> List[Dict]:
+    merged = merge_speaker_intervals(intervals)
+    if len(merged) < 3:
+        return merged
+
+    changed = True
+    while changed and len(merged) >= 3:
+        changed = False
+        output = [dict(merged[0])]
+        index = 1
+        while index < len(merged) - 1:
+            previous = output[-1]
+            current = dict(merged[index])
+            following = dict(merged[index + 1])
+            current_duration = max(0.0, current["end"] - current["start"])
+            left_gap = max(0.0, current["start"] - previous["end"])
+            right_gap = max(0.0, following["start"] - current["end"])
+            if (
+                current_duration <= max_duration
+                and previous["speaker"] == following["speaker"]
+                and left_gap <= max_gap
+                and right_gap <= max_gap
+            ):
+                previous["end"] = max(previous["end"], following["end"])
+                index += 2
+                changed = True
+                continue
+
+            output.append(current)
+            index += 1
+
+        if index == len(merged) - 1:
+            output.append(dict(merged[-1]))
+        merged = merge_speaker_intervals(output)
+
     return merged
 
 
@@ -2069,6 +2289,54 @@ def smooth_unknown_segments(segments: Sequence[Dict]) -> List[Dict]:
     return smoothed
 
 
+def smooth_short_speaker_turns(
+    segments: Sequence[Dict],
+    *,
+    max_duration: float = DEFAULT_SHORT_SPEAKER_TURN_SECONDS,
+    max_text_chars: int = DEFAULT_SHORT_SPEAKER_TURN_TEXT_CHARS,
+    max_gap: float = DEFAULT_SEGMENT_MERGE_GAP,
+) -> List[Dict]:
+    smoothed = [clone_segment(segment) for segment in segments]
+    if len(smoothed) < 3:
+        return smoothed
+
+    for idx in range(1, len(smoothed) - 1):
+        previous = smoothed[idx - 1]
+        current = smoothed[idx]
+        following = smoothed[idx + 1]
+
+        current_speaker = str(current.get("speaker") or UNKNOWN_SPEAKER)
+        previous_speaker = str(previous.get("speaker") or UNKNOWN_SPEAKER)
+        following_speaker = str(following.get("speaker") or UNKNOWN_SPEAKER)
+        if (
+            current_speaker == UNKNOWN_SPEAKER
+            or previous_speaker == UNKNOWN_SPEAKER
+            or following_speaker == UNKNOWN_SPEAKER
+            or previous_speaker != following_speaker
+            or current_speaker == previous_speaker
+        ):
+            continue
+
+        duration = max(0.0, current["end"] - current["start"])
+        text_chars = len(re.sub(r"\s+", "", str(current.get("text") or "")))
+        previous_duration = max(0.0, previous["end"] - previous["start"])
+        following_duration = max(0.0, following["end"] - following["start"])
+        left_gap = max(0.0, current["start"] - previous["end"])
+        right_gap = max(0.0, following["start"] - current["end"])
+        if duration > max_duration and text_chars > max_text_chars:
+            continue
+        if left_gap > max_gap or right_gap > max_gap:
+            continue
+        if previous_duration < 1.5 and following_duration < 1.5:
+            continue
+
+        current["speaker"] = previous_speaker
+        for word in current.get("words", []) or []:
+            word["speaker"] = previous_speaker
+
+    return smoothed
+
+
 def merge_adjacent_segments(segments: Sequence[Dict], max_gap: float) -> List[Dict]:
     merged = []
     for segment in segments:
@@ -2186,8 +2454,37 @@ def compress_repeated_short_tokens(text: str) -> str:
         index += 1
 
     if not changed and not phrase_changed:
+        phrase_compressed = list(compressed)
+
+    trigram_compressed: List[str] = []
+    trigram_changed = False
+    index = 0
+    while index < len(phrase_compressed):
+        replaced = False
+        if index + 2 < len(phrase_compressed):
+            phrase = phrase_compressed[index : index + 3]
+            phrase_core_len = sum(
+                len(re.sub(r"[^0-9A-Za-z가-힣]+", "", token))
+                for token in phrase
+            )
+            run_end = index + 3
+            repeats = 1
+            while run_end + 2 < len(phrase_compressed) and phrase_compressed[run_end : run_end + 3] == phrase:
+                repeats += 1
+                run_end += 3
+            if repeats >= 3 and phrase_core_len <= 12:
+                trigram_compressed.extend(phrase)
+                trigram_changed = True
+                index = run_end
+                replaced = True
+        if replaced:
+            continue
+        trigram_compressed.append(phrase_compressed[index])
+        index += 1
+
+    if not changed and not phrase_changed and not trigram_changed:
         return text
-    return " ".join(phrase_compressed)
+    return " ".join(trigram_compressed)
 
 
 def normalize_transcript_text(text: str) -> str:
@@ -2301,6 +2598,7 @@ def build_public_payload(
     args: argparse.Namespace,
     review_records: Sequence[Dict],
     correction_records: Sequence[Dict],
+    hallucination_records: Sequence[Dict],
 ) -> Dict:
     speaker_names = sorted(
         {
@@ -2317,8 +2615,15 @@ def build_public_payload(
         "diarized": args.diarize,
         "models": {
             "transcription": effective_transcribe_model(args),
-            "diarize_asr": None,
             "diarization": args.diarize_model if args.diarize else None,
+        },
+        "quality": {
+            "profile": args.quality,
+            "sample_len": DEFAULT_TRANSCRIBE_SAMPLE_LEN,
+            "review_sample_len": DEFAULT_REVIEW_SAMPLE_LEN,
+            "review_pass": bool(getattr(args, "review_pass", True)),
+            "text_correction": bool(getattr(args, "text_correction", True)),
+            "word_timestamps": any(segment.get("words") for segment in segments),
         },
         "chunking": {
             "enabled": len(chunks) > 1,
@@ -2341,6 +2646,7 @@ def build_public_payload(
             "review_applied_count": sum(1 for item in review_records if item.get("accepted")),
             "text_correction": bool(getattr(args, "text_correction", True)),
             "text_correction_count": len(correction_records),
+            "hallucination_prune_count": len(hallucination_records),
             "glossary_term_count": len(getattr(args, "glossary_entries", [])),
         },
         "segments": list(segments),
@@ -2376,12 +2682,14 @@ def compute_current_segments(
     diarize: bool,
 ) -> List[Dict]:
     if diarize:
-        labeled_segments = assign_speakers_to_segments(transcription_segments, speaker_intervals)
+        cleaned_intervals = suppress_micro_speaker_flips(speaker_intervals)
+        labeled_segments = assign_speakers_to_segments(transcription_segments, cleaned_intervals)
         split_segments = split_segments_by_speaker(
             labeled_segments,
             break_gap=DEFAULT_SEGMENT_BREAK_GAP,
         )
         smoothed_segments = smooth_unknown_segments(split_segments)
+        smoothed_segments = smooth_short_speaker_turns(smoothed_segments)
         return merge_adjacent_segments(
             smoothed_segments,
             max_gap=DEFAULT_SEGMENT_MERGE_GAP,
@@ -2406,6 +2714,7 @@ def write_progress_outputs(
     transcription_segments: Sequence[Dict],
     speaker_intervals: Sequence[Dict],
     review_records: Optional[Sequence[Dict]] = None,
+    hallucination_records: Optional[Sequence[Dict]] = None,
 ) -> Tuple[List[Dict], Dict, List[Path]]:
     current_segments = compute_current_segments(
         transcription_segments=transcription_segments,
@@ -2423,6 +2732,7 @@ def write_progress_outputs(
         args=args,
         review_records=list(review_records or []),
         correction_records=correction_records,
+        hallucination_records=list(hallucination_records or []),
     )
     written_outputs = write_requested_outputs(
         layout=layout,
@@ -2459,13 +2769,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             f"전사 품질 프로파일 (기본: {DEFAULT_QUALITY}, "
-            "max는 fp16/greedy + stricter review pass"
+            "fast=turbo, normal=v3, max=v3 + stricter review pass)"
         ),
-    )
-    parser.add_argument(
-        "--diarize-asr-model",
-        default="small",
-        help="호환성용 옵션. 현재는 사용되지 않음",
     )
     parser.add_argument(
         "--diarize-model",
@@ -2617,6 +2922,7 @@ def process_audio_file(
         source_audio = materialize_chunk(work_audio_path, chunk, force=args.force)
         chunk_dir = artifact_dir / f"chunk_{chunk.index:03d}"
         chunk_dir.mkdir(parents=True, exist_ok=True)
+        chunk_context_prompt = build_chunk_context_prompt(merged_transcription_segments[-2:])
 
         chunk_started = time.perf_counter()
         log(
@@ -2630,6 +2936,7 @@ def process_audio_file(
                 chunk_dir,
                 args,
                 word_timestamps=use_word_timestamps,
+                extra_prompt=chunk_context_prompt,
                 language_override=runtime_language,
             )
         )
@@ -2661,6 +2968,7 @@ def process_audio_file(
                 transcription_segments=merged_transcription_segments,
                 speaker_intervals=[],
                 review_records=[],
+                hallucination_records=[],
             )
             write_json(artifact_dir / "transcription.partial.json", preview_payload)
             write_json(artifact_dir / "final.partial.json", preview_payload)
@@ -2672,6 +2980,7 @@ def process_audio_file(
             )
 
     review_records = []
+    hallucination_records = []
     if merged_transcription_segments:
         refined_segments, review_records = refine_transcription_segments(
             work_audio_path,
@@ -2685,6 +2994,15 @@ def process_audio_file(
         merged_transcription_segments = refined_segments
         if review_records:
             write_json(artifact_dir / "review_windows.json", {"windows": review_records})
+        merged_transcription_segments, hallucination_records = prune_hallucination_like_segments(
+            merged_transcription_segments
+        )
+        if hallucination_records:
+            write_json(
+                artifact_dir / "hallucination_pruned.json",
+                {"segments": hallucination_records},
+            )
+            log(f"hallucination 정리: {len(hallucination_records)}개 세그먼트 제거")
 
     if args.diarize:
         log(f"화자 분리 중 (00:00 - {format_clock(duration)})...")
@@ -2720,6 +3038,7 @@ def process_audio_file(
         transcription_segments=merged_transcription_segments,
         speaker_intervals=merged_intervals,
         review_records=review_records,
+        hallucination_records=hallucination_records,
     )
     write_json(artifact_dir / "final.json", payload)
     shared_glossary_path, shared_glossary_added = update_shared_glossary(
@@ -2818,11 +3137,12 @@ def main() -> None:
                 "--diarize 사용 시 HF 토큰이 필요합니다. "
                 "--hf-token 또는 HF_TOKEN/HUGGINGFACE_TOKEN 환경변수를 사용하세요."
             )
+        ensure_hf_hub_env_token(hf_token)
 
         log(f"입력 오디오 {len(audio_files)}개를 처리합니다.")
         log(f"전사 품질 프로파일: {args.quality}")
         log(f"전사 모델: {effective_transcribe_model(args)}")
-        log("전사 정밀도: fp16")
+        log("전사 정밀도: fp32")
         log(f"review pass: {bool(args.review_pass)}")
         log(f"text correction: {bool(args.text_correction)}")
         log(f"progress outputs: {bool(args.progress_outputs)}")
@@ -2837,15 +3157,28 @@ def main() -> None:
         if args.diarize:
             log(f"공유 diarization 모델 캐시: {shared_model_cache_dir(layout)}")
         for audio_path in audio_files:
-            args.glossary_entries = resolve_glossary_entries(
-                args,
+            file_args = argparse.Namespace(**vars(args))
+            file_args.glossary_entries = resolve_glossary_entries(
+                file_args,
                 local_config,
-                shared_glossary_path=args.shared_glossary_path,
+                shared_glossary_path=file_args.shared_glossary_path,
             )
+            if (
+                file_args.diarize
+                and file_args.num_speakers is None
+                and file_args.min_speakers is None
+                and file_args.max_speakers is None
+            ):
+                inferred_speakers = infer_num_speakers_from_filename(audio_path)
+                if inferred_speakers is not None:
+                    file_args.num_speakers = inferred_speakers
+                    file_args.min_speakers = inferred_speakers
+                    file_args.max_speakers = inferred_speakers
+                    log(f"화자 수 자동 추정: {audio_path.name} -> {inferred_speakers}명")
             process_audio_file(
                 audio_path=audio_path,
                 layout=layout,
-                args=args,
+                args=file_args,
                 formats=formats,
                 hf_token=hf_token,
             )

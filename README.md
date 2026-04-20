@@ -4,7 +4,7 @@ Apple Silicon Mac에서 미팅 녹음을 로컬로 전사하는 도구.
 Notta 같은 유료 서비스 없이, 더 높은 퀄리티로 전사 + 화자 분리까지 가능.
 
 최근 업데이트:
-- 기본 전사 품질 프로파일을 `max + fp16 + greedy`로 두고, review pass만 더 공격적으로 보정
+- 기본 전사 품질 프로파일을 `max + fp32 + greedy`로 두고, review pass만 더 공격적으로 보정
 - 수상한 구간만 짧게 다시 보는 selective review pass 추가
 - glossary 기반 전사 보정 + 최종 텍스트 교정 레이어 추가
 - `mlx_whisper` word timestamp 기반 후처리
@@ -14,7 +14,7 @@ Notta 같은 유료 서비스 없이, 더 높은 퀄리티로 전사 + 화자 �
 - `whispermlx` 화자 분리 결과를 더 촘촘하게 병합
 - diarize 시 공유 16kHz mono WAV를 한 번만 만들어 전사/화자분리 재사용
 - txt-only 전사에서는 불필요한 word timestamp 생성을 생략
-- 중간 progress 출력은 기본적으로 끄고 최종 결과 중심으로 저장
+- 중간 progress 출력은 기본적으로 켜서 긴 파일 처리 상황을 확인 가능
 - `txt/json/srt/vtt` 출력 지원
 - artifact/cache 저장으로 재실행 속도 개선
 - 긴 오디오 자동 chunking
@@ -79,7 +79,7 @@ whispermlx --help
 python3 transcribe.py meeting.m4a
 ```
 
-기본적으로 `--quality max`, `fp16`, `greedy`로 실행되며, 별도 모델을 지정하지 않았을 때는
+기본적으로 `--quality max`, `fp32`, `greedy`로 실행되며, 별도 모델을 지정하지 않았을 때는
 `mlx-community/whisper-large-v3-mlx`를 사용한다. 또한 반복 루프를 줄이기 위해
 이전 텍스트 conditioning은 끄고, review pass에서만 더 넓은 fallback 재시도(`best_of`)를 사용한다.
 추가로 기본적으로 review pass와 text correction이 켜져 있어, 수상한 구간만 짧게 재전사하고
@@ -154,6 +154,31 @@ python3 transcribe.py meeting.m4a --diarize --num-speakers 2
 python3 transcribe.py meeting.m4a --diarize -o ./output
 ```
 
+### 배치 실행
+
+Input 폴더의 새 파일을 최신 항목부터 순서대로 전사하려면:
+
+```bash
+bash ./scripts/run_detached_diarize_batch.sh
+```
+
+기본 흐름은 아래와 같다.
+
+- `Whisper_output/<파일명>.txt`가 이미 있고 비어 있지 않으면 새 파일 큐에서는 건너뜀
+- 새 파일은 생성시간/수정시간/파일명 날짜 기준으로 최신 항목부터 처리
+
+기존 결과/cache까지 무시하고 전부 fp32로 다시 돌릴 때:
+
+```bash
+WHISPER_BATCH_FORCE_RERUN=1 bash ./scripts/run_detached_diarize_batch.sh
+```
+
+삭제된 `txt`만 artifact에서 복구하고 싶을 때는 명시적으로 켠다:
+
+```bash
+WHISPER_RESTORE_FROM_ARTIFACTS=1 bash ./scripts/run_detached_diarize_batch.sh
+```
+
 ### 여러 출력 형식 생성
 
 ```bash
@@ -168,21 +193,22 @@ python3 transcribe.py meeting.m4a --formats all
 
 ### 품질 프로파일
 
-기본값은 `max + fp16 + greedy`다.
+기본값은 `max + fp32 + greedy`다.
 
 ```bash
-# 기본값: 최고 품질
+# 기본값: 최고 품질(v3)
 python3 transcribe.py meeting.m4a
 
-# 속도 우선
+# 속도 우선(turbo)
 python3 transcribe.py meeting.m4a --quality fast
 
-# 균형형
-python3 transcribe.py meeting.m4a --quality standard
+# 균형형(v3)
+python3 transcribe.py meeting.m4a --quality normal
 ```
 
-`max`에서는 커스텀 `--transcribe-model`을 따로 주지 않았을 때
-`mlx-community/whisper-large-v3-mlx`를 사용하며, 1차 전사는 기본적으로 `fp16 + greedy`로 실행한다.
+`normal`과 `max`에서는 커스텀 `--transcribe-model`을 따로 주지 않았을 때
+`mlx-community/whisper-large-v3-mlx`를 사용하며, 1차 전사는 기본적으로 `fp32 + greedy`로 실행한다.
+`fast`는 `mlx-community/whisper-large-v3-turbo`를 사용한다.
 수상한 구간만 review pass에서 `best_of + temperature fallback`으로 다시 본다.
 반복 방지를 위해 previous-text conditioning도 끈 상태다.
 
@@ -248,17 +274,16 @@ python3 transcribe.py long_meeting.m4a --no-auto-chunk
 또한 diarize 모드에서는 공유 작업용 WAV를 한 번만 만들어 전사/화자분리에서 같이 사용한다.
 긴 오디오여도 diarization pipeline은 chunk마다 다시 띄우지 않고 파일 단위로 한 번만 실행한다.
 가능한 경우 pyannote의 `exclusive` diarization 결과를 우선 사용해 word-speaker reconciliation 오차를 줄인다.
-이전보다 diarize 모드 속도가 더 빨라진 대신, `--diarize-asr-model` 옵션은 호환성만 남아 있고 실제로는 사용되지 않는다.
 
 전사만 할 때 `--formats txt`로 실행하면 word timestamp를 만들지 않아 더 빠르다.
 읽어보는 용도의 1차 검토는 `txt`만 먼저 뽑는 것이 가장 효율적이다.
 `--formats json`에서만 word-level 데이터가 유지된다.
 JSON이 필요할 때만 `--formats txt,json`처럼 명시해서 추가하면 된다.
 
-기본적으로는 chunk 중간 결과를 계속 쓰지 않는다. 실행 중간 저장이 필요할 때만:
+기본적으로 chunk 중간 결과를 계속 저장한다. 실행 중간 저장을 끄고 싶을 때만:
 
 ```bash
-python3 transcribe.py meeting.m4a --progress-outputs
+python3 transcribe.py meeting.m4a --no-progress-outputs
 ```
 
 ## Tips
