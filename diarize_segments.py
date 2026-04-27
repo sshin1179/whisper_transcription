@@ -147,6 +147,11 @@ def main() -> None:
     payload = {
         "intervals": regular_intervals,
         "exclusive_intervals": exclusive_intervals,
+        "requested": {
+            "num_speakers": num_speakers,
+            "min_speakers": None if num_speakers is not None else args.min_speakers,
+            "max_speakers": None if num_speakers is not None else args.max_speakers,
+        },
     }
     if exclusive_intervals:
         payload["preferred"] = "exclusive_intervals"
